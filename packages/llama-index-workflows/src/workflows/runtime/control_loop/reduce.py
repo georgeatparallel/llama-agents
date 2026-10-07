@@ -358,6 +358,31 @@ def _next_work_item_id(state: BrokerState) -> str:
     return f"work_item_{state.work_item_seq}"
 
 
+def _next_invocation_id(broker: BrokerState, path: tuple[str, ...]) -> str:
+    """Mint the identity of one step dispatch.
+
+    Every ``CommandRunWorker`` carries a fresh id: first dispatch, retry,
+    rewind rerun and stale-collect rerun. The counter is serialized, so a live
+    run and a replay of its journal mint the same ids in the same order.
+    """
+    broker.invocation_seq += 1
+    local = f"invocation_{broker.invocation_seq}"
+    return "/".join((*path, local)) if path else local
+
+
+def _start_rerun(
+    broker: BrokerState, path: tuple[str, ...], execution: InProgressState
+) -> str:
+    """Turn an in-progress execution into a new invocation of the same work."""
+    invocation_id = _next_invocation_id(broker, path)
+    execution.invocation_id = invocation_id
+    execution.received = set()
+    execution.shared_state = replace(
+        execution.shared_state, invocation_id=invocation_id
+    )
+    return invocation_id
+
+
 def _decide_retry_delay(
     policy: RetryPolicy | None,
     *,
@@ -393,7 +418,7 @@ def _decide_retry_delay(
 
 def _drain_eligible_queue(
     step_id: StepId,
-    state: InternalStepWorkerState,
+    broker: BrokerState,
     path: tuple[str, ...],
     now_seconds: float,
 ) -> list[WorkflowCommand]:
@@ -404,6 +429,7 @@ def _drain_eligible_queue(
     eligible attempts is preserved.
     """
     commands: list[WorkflowCommand] = []
+    state = broker.workers[step_id]
     while len(state.in_progress) < state.config.num_workers:
         index = next(
             (i for i, a in enumerate(state.queue) if _is_eligible(a)),
@@ -413,7 +439,7 @@ def _drain_eligible_queue(
             break
         attempt = state.queue.pop(index)
         commands.extend(
-            _add_or_enqueue_event(attempt, step_id, state, path, now_seconds)
+            _add_or_enqueue_event(attempt, step_id, broker, path, now_seconds)
         )
     return commands
 
@@ -459,7 +485,7 @@ def _rewind_broker(
                 ),
             )
         step_state.in_progress = []
-        commands.extend(_drain_eligible_queue(step_id, step_state, path, now_seconds))
+        commands.extend(_drain_eligible_queue(step_id, state, path, now_seconds))
         for attempt in step_state.queue:
             if attempt.not_before is not None:
                 commands.append(CommandScheduleWakeup(at_time=attempt.not_before))
@@ -592,19 +618,40 @@ class _FanOutScope:
 
 
 def _find_in_progress(
-    worker_state: InternalStepWorkerState, worker_id: int
+    worker_state: InternalStepWorkerState, tick: TickStepResult
 ) -> InProgressState:
-    execution = next(
-        (w for w in worker_state.in_progress if w.worker_id == worker_id), None
-    )
+    """Locate the execution a step result belongs to.
+
+    Current results name their invocation. Results journaled before
+    invocation ids existed fall back to the worker slot.
+    """
+    if tick.invocation_id is not None:
+        execution = next(
+            (
+                w
+                for w in worker_state.in_progress
+                if w.invocation_id == tick.invocation_id
+            ),
+            None,
+        )
+    else:
+        execution = next(
+            (w for w in worker_state.in_progress if w.worker_id == tick.worker_id),
+            None,
+        )
     if execution is None:
         # this should not happen unless there's a logic bug in the control loop
-        raise ValueError(f"Worker {worker_id} not found in in_progress")
+        raise ValueError(
+            f"Invocation {tick.invocation_id} of step {tick.step_id} on worker "
+            f"{tick.worker_id} not found in in_progress"
+        )
     return execution
 
 
 def _rerun_for_stale_collect_buffer(
     tick: TickStepResult,
+    broker: BrokerState,
+    path: tuple[str, ...],
     worker_state: InternalStepWorkerState,
     this_execution: InProgressState,
 ) -> list[WorkflowCommand] | None:
@@ -624,12 +671,15 @@ def _rerun_for_stale_collect_buffer(
     if not stale_firing:
         return None
     _refresh_collect_snapshot(worker_state, this_execution)
+    invocation_id = _start_rerun(broker, path, this_execution)
     return [
         CommandRunWorker(
             step_id=tick.step_id,
             event=this_execution.event,
             bound_events=this_execution.bound_events,
             id=this_execution.worker_id,
+            invocation_namespace=path,
+            invocation_id=invocation_id,
         )
     ]
 
@@ -739,6 +789,7 @@ def _apply_step_result(
             # updating the run state
             acc.step_no_longer_in_progress = False
             _refresh_collect_snapshot(state.workers[step_id], this_execution)
+            invocation_id = _start_rerun(state, path, this_execution)
             acc.commands.append(
                 CommandRunWorker(
                     step_id=step_id,
@@ -746,6 +797,7 @@ def _apply_step_result(
                     bound_events=this_execution.bound_events,
                     id=this_execution.worker_id,
                     invocation_namespace=path,
+                    invocation_id=invocation_id,
                 )
             )
         else:
@@ -1046,9 +1098,11 @@ def _process_step_result_tick(
     step_id = tick.step_id
     step_name = _root_step_key(step_id)
     worker_state = broker.workers[step_id]
-    this_execution = _find_in_progress(worker_state, tick.worker_id)
+    this_execution = _find_in_progress(worker_state, tick)
 
-    rerun = _rerun_for_stale_collect_buffer(tick, worker_state, this_execution)
+    rerun = _rerun_for_stale_collect_buffer(
+        tick, broker, path, worker_state, this_execution
+    )
     if rerun is not None:
         return state, rerun
 
@@ -1095,9 +1149,7 @@ def _process_step_result_tick(
             worker_state.in_progress.remove(this_execution)
     # enqueue next events if there are any
     if not is_completed:
-        acc.commands.extend(
-            _drain_eligible_queue(step_id, worker_state, path, now_seconds)
-        )
+        acc.commands.extend(_drain_eligible_queue(step_id, broker, path, now_seconds))
 
     return state, acc.commands
 
@@ -1166,7 +1218,7 @@ def _select_static_collect_batch(
 def _add_or_enqueue_event(
     event: EventAttempt,
     step_id: StepId,
-    state: InternalStepWorkerState,
+    broker: BrokerState,
     path: tuple[str, ...],
     now_seconds: float,
 ) -> list[WorkflowCommand]:
@@ -1175,6 +1227,7 @@ def _add_or_enqueue_event(
     Note! This mutates the state, assuming that its already been deepcopied in an outer scope.
     """
     commands: list[WorkflowCommand] = []
+    state = broker.workers[step_id]
     step_name = _static_step_name(path, step_id)
     # Determine if there is available capacity based on in_progress workers.
     # Delayed attempts (not_before set) are never dispatched here; they wait
@@ -1187,6 +1240,7 @@ def _add_or_enqueue_event(
         used = set(x.worker_id for x in state.in_progress)
         id_candidates = [i for i in range(state.config.num_workers) if i not in used]
         id = id_candidates[0]
+        invocation_id = _next_invocation_id(broker, path)
         state_copy = state._deepcopy()
         shared_state: StepWorkerState = StepWorkerState(
             step_name=step_name,
@@ -1197,6 +1251,7 @@ def _add_or_enqueue_event(
             else None,
             scope_path=event.scope_path,
             work_item_id=event.work_item_id,
+            invocation_id=invocation_id,
         )
         state.in_progress.append(
             InProgressState(
@@ -1212,6 +1267,7 @@ def _add_or_enqueue_event(
                 scope_path=event.scope_path,
                 work_item_id=event.work_item_id,
                 collect_generations=dict(state.collect_generations),
+                invocation_id=invocation_id,
             )
         )
         commands.append(
@@ -1221,6 +1277,7 @@ def _add_or_enqueue_event(
                 id=id,
                 invocation_namespace=path,
                 bound_events=event.bound_events,
+                invocation_id=invocation_id,
             )
         )
         commands.append(
@@ -1298,7 +1355,7 @@ def _redeliver_collection_payload(
             work_item_id=tick.work_item_id,
         ),
         binding.target_step,
-        state.workers[binding.target_step],
+        state,
         path,
         now_seconds,
     )
@@ -1345,7 +1402,7 @@ def _resolve_waiters(
                             work_item_id=wait_condition.work_item_id,
                         ),
                         step_id,
-                        state.workers[step_id],
+                        state,
                         path,
                         now_seconds,
                     )
@@ -1429,7 +1486,7 @@ def _route_member_to_collect_step(
                 _fire_collection_release(
                     binding,
                     stream_id,
-                    worker_state,
+                    state,
                     release,
                     tuple(tick.scope_path[:-1]),
                     path,
@@ -1517,7 +1574,7 @@ def _route_to_accepting_steps(
                     work_item_id=tick.work_item_id,
                 ),
                 step_id,
-                state.workers[step_id],
+                state,
                 path,
                 now_seconds,
             )
@@ -1710,7 +1767,7 @@ def _process_wakeup_tick(
             if attempt.not_before is not None and attempt.not_before <= tick.due:
                 attempt.not_before = None
         commands.extend(
-            _drain_eligible_queue(step_id, worker_state, descent.path, now_seconds)
+            _drain_eligible_queue(step_id, descent.broker, descent.path, now_seconds)
         )
     return state, commands
 
@@ -1747,7 +1804,7 @@ def _process_waiter_timeout_tick(
             work_item_id=waiter.work_item_id,
         ),
         step_id,
-        worker_state,
+        broker,
         descent.path,
         now_seconds,
     )
